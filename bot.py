@@ -22,8 +22,11 @@ from telegram.ext import (
 )
 
 # ========= CONFIG =========
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty")
 
 LOG_DIR = "logs"
 RESULT_DIR = "results"
