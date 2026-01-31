@@ -1,165 +1,313 @@
-# ============================
-# 🤖 TrpZy Private Search Bot
-# ============================
-
 import os
 import re
-import asyncio
+import json
+import math
+import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputFile,
+    InlineKeyboardMarkup
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    filters
 )
+from telegram.request import HTTPXRequest
 
-# ========= CONFIG =========
-TOKEN = os.getenv("BOT_TOKEN")
+# ================= ENV CONFIG =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty (set Environment Variable)")
 
-LOG_DIR = "logs"
-RESULT_DIR = "results"
-CACHE_DIR = "cache"
-
+# ================= BOT CONFIG =================
+LOG_FOLDER = "logs"
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 1000
-THREADS = 16
+THREADS = 6
 
-os.makedirs(RESULT_DIR, exist_ok=True)
+START_IMAGE = os.getenv(
+    "START_IMAGE",
+    "https://i.ibb.co.com/1tm2gWPL/IMG-20260131-191235-274.jpg"
+)
+
+CACHE_DIR = "cache"
+CACHE_FILE = os.path.join(CACHE_DIR, "index.json")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ========= REGEX =========
-REGEX_URL = re.compile(r"https?://[^\s:/]+[:/]+([^:\s]+):([^:\s]+)")
-REGEX_UP = re.compile(r"^([^:\s]+):([^:\s]+)$")
+# ================= REGEX =================
+REGEX_UP = re.compile(r"^[^:/\s]+:[^:/\s]+$")              # user:pass
+REGEX_URLUP = re.compile(r"^https?://\S+:[^:\s]+:[^:\s]+$") # url:user:pass
 
-# ========= UTIL =========
-def banner():
-    return """
-🤖 TrpZy Bot RUNNING
-Ultra Fast • MultiThread
-Private Access Only
-"""
+user_session = {}
 
-def extract_user_pass(line: str):
-    line = line.strip()
-    m = REGEX_URL.search(line)
-    if m:
-        return f"{m.group(1)}:{m.group(2)}"
-    m = REGEX_UP.match(line)
-    if m:
-        return f"{m.group(1)}:{m.group(2)}"
-    return None
+# ================= UTILS =================
+def is_owner(update: Update):
+    return update.effective_user and update.effective_user.id == OWNER_ID
 
-def scan_file(path, keyword):
-    results = set()
+def load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
     try:
-        with open(path, "r", errors="ignore") as f:
-            for line in f:
-                if keyword.lower() in line.lower():
-                    up = extract_user_pass(line)
-                    if up:
-                        results.add(up)
+        with open(CACHE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_cache(cache):
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f)
     except:
         pass
-    return results
 
-def scan_all(keyword):
-    all_results = set()
-    files = [
-        os.path.join(LOG_DIR, f)
-        for f in os.listdir(LOG_DIR)
-        if os.path.isfile(os.path.join(LOG_DIR, f))
-    ]
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔍 Search UP", callback_data="mode_up"),
+            InlineKeyboardButton("🌐 Search URLUP", callback_data="mode_urlup")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+        ]
+    ])
 
-    with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        tasks = [ex.submit(scan_file, f, keyword) for f in files]
-        for t in tasks:
-            all_results.update(t.result())
+def list_log_files():
+    files = []
+    for root, _, names in os.walk(LOG_FOLDER):
+        for n in names:
+            if n.endswith(".txt"):
+                files.append(os.path.join(root, n))
+    return files
 
-    return all_results
+# ================= SCANNER =================
+def extract_up(line: str):
+    """
+    Return user:pass ONLY.
+    Accepts:
+      - user:pass
+      - url:user:pass -> user:pass
+    """
+    line = line.strip()
+    if ":" not in line:
+        return None
 
-# ========= BOT HANDLERS =========
+    parts = line.split(":")
+    if line.startswith("http") and len(parts) >= 3:
+        up = parts[-2] + ":" + parts[-1]
+        return up if REGEX_UP.fullmatch(up) else None
+
+    return line if REGEX_UP.fullmatch(line) else None
+
+def scan_file(path, keyword, mode, limit, cache):
+    found = set()
+    kw = keyword.lower()
+
+    try:
+        stat = os.stat(path)
+        size = stat.st_size
+        mtime = int(stat.st_mtime)
+    except:
+        return found
+
+    cache.setdefault(kw, {})
+    entry = cache[kw].get(path)
+
+    try:
+        with open(path, "r", errors="ignore") as f:
+            # ===== CACHE FAST PATH =====
+            if entry and entry.get("size") == size and entry.get("mtime") == mtime:
+                for idx, line in enumerate(f):
+                    if idx not in entry.get("lines", []):
+                        continue
+                    if len(found) >= limit:
+                        break
+
+                    line = line.strip()
+                    if mode == "up":
+                        up = extract_up(line)
+                        if up:
+                            found.add(up)
+                    else:
+                        if REGEX_URLUP.fullmatch(line):
+                            found.add(line)
+                return found
+
+            # ===== FULL SCAN =====
+            hit_lines = []
+            for idx, line in enumerate(f):
+                if len(found) >= limit:
+                    break
+
+                line = line.strip()
+                if not line or kw not in line.lower():
+                    continue
+
+                hit_lines.append(idx)
+
+                if mode == "up":
+                    up = extract_up(line)
+                    if up:
+                        found.add(up)
+                else:
+                    if REGEX_URLUP.fullmatch(line):
+                        found.add(line)
+
+            cache[kw][path] = {
+                "size": size,
+                "mtime": mtime,
+                "lines": hit_lines
+            }
+
+    except:
+        pass
+
+    return found
+
+# ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Private bot.")
+    if not is_owner(update):
         return
 
-    await update.message.reply_photo(
-        photo="https://i.ibb.co.com/1tm2gWPL/IMG-20260131-191235-274.jpg",
-        caption=banner(),
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔍 Search", callback_data="search")]]
-        ),
+    caption = (
+        "🤖 *TrpZy Private Log Search Bot*\n\n"
+        "⚡ Ultra Fast • MultiThread\n"
+        "🧠 Smart Cache\n"
+        "🧹 Clean Duplicate\n"
+        "🔒 Private Only\n\n"
+        "👇 Pilih mode"
     )
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_photo(
+        photo=START_IMAGE,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
     q = update.callback_query
     await q.answer()
 
-    if q.data == "search":
-        await q.message.reply_text(
-            "Gunakan:\n/search <keyword> [limit]\n\nContoh:\n/search roblox 500"
-        )
-
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
+    if q.data == "cancel":
+        user_session.pop(q.from_user.id, None)
+        await q.edit_message_caption("❌ Dibatalkan")
         return
 
-    if not context.args:
-        await update.message.reply_text("❌ Keyword kosong.")
+    mode = "up" if q.data == "mode_up" else "urlup"
+    user_session[q.from_user.id] = mode
+
+    await q.edit_message_caption(
+        caption=f"📄 Mode: `{mode}`\n\nKirim *keyword* 🔎",
+        parse_mode="Markdown"
+    )
+
+async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
         return
 
-    keyword = context.args[0]
+    uid = update.effective_user.id
+    if uid not in user_session:
+        return
+
+    keyword = update.message.text.strip()
+    mode = user_session.pop(uid)
     limit = DEFAULT_LIMIT
 
-    if len(context.args) > 1:
-        try:
-            limit = min(int(context.args[1]), MAX_LIMIT)
-        except:
-            pass
+    files = list_log_files()
+    total = len(files)
 
-    msg = await update.message.reply_text("⏳ Scanning logs...")
+    progress = await update.message.reply_text(
+        f"🔍 Keyword: `{keyword}`\n📂 Files: `{total}`\n⏳ Scanning...",
+        parse_mode="Markdown"
+    )
 
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, scan_all, keyword)
+    cache = load_cache()
+    results = set()
+    done = 0
+    last = time.time()
+
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures = {
+            ex.submit(scan_file, p, keyword, mode, limit, cache): p
+            for p in files
+        }
+
+        for fut in as_completed(futures):
+            done += 1
+            results |= fut.result()
+            if len(results) > limit:
+                results = set(list(results)[:limit])
+
+            if time.time() - last >= 1:
+                percent = math.floor((done / max(total,1)) * 100)
+                try:
+                    await progress.edit_text(
+                        f"📊 Progress: `{percent}%` ({done}/{total})\n"
+                        f"📌 Result: `{len(results)}`",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+                last = time.time()
+
+            if len(results) >= limit:
+                break
+
+    save_cache(cache)
 
     if not results:
-        await msg.edit_text("❌ Tidak ada hasil.")
+        await progress.edit_text("❌ Tidak ada hasil")
         return
 
-    results = list(results)[:limit]
-
     now = datetime.now()
-    fname = f"TrpZy{keyword}_{now.day}_{now.month}_{now.year}.txt"
-    fpath = os.path.join(RESULT_DIR, fname)
+    fname = f"TrpZy{keyword}_{now.day:02d}_{now.month:02d}_{now.year}.txt"
 
-    with open(fpath, "w") as f:
-        f.write("\n".join(results))
+    with open(fname, "w") as f:
+        f.write("\n".join(sorted(results)))
 
-    await msg.edit_text(f"✅ Ditemukan {len(results)} result")
-    await update.message.reply_document(InputFile(fpath))
+    await update.message.reply_document(
+        open(fname, "rb"),
+        caption=f"✅ *TrpZy Result* — {len(results)} line",
+        parse_mode="Markdown"
+    )
 
-# ========= MAIN =========
-def main():
-    print(banner())
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    os.remove(fname)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search))
-    app.add_handler(CallbackQueryHandler(button))
+    await update.message.reply_text(
+        "🔁 Search lagi?",
+        reply_markup=main_keyboard()
+    )
 
-    app.run_polling()
+# ================= APP =================
+request = HTTPXRequest(
+    connect_timeout=20,
+    read_timeout=20,
+    write_timeout=20,
+    pool_timeout=20
+)
 
-if __name__ == "__main__":
-    main()
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .request(request)
+    .build()
+)
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keyword))
+
+print("🤖 TrpZy Bot RUNNING")
+app.run_polling()
